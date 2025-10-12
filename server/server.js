@@ -12,16 +12,16 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// ----- App & middleware -----
+// ----- App -----
 const app = express();
 app.use(express.json({ limit: '10mb' }));
-app.use(cors({ origin: true })); // MVP: разрешаем все источники, при желании сузим
+app.use(cors({ origin: true })); // MVP: разрешаем все истоки
 
 // ----- Config -----
 const RUNWAY_BASE = process.env.RUNWAY_API_URL || 'https://api.dev.runwayml.com';
 const RUNWAY_KEY  = process.env.RUNWAY_API_KEY || '';
 const RUNWAY_VER  = process.env.RUNWAY_API_VERSION || '2024-11-06'; // актуальная дата-версия API
-const PUBLIC_BASE = process.env.PUBLIC_BASE_URL || null;             // например: https://api.wowow.ru
+const PUBLIC_BASE = process.env.PUBLIC_BASE_URL || null;             // напр.: https://api.wowow.ru
 
 console.log('Using Runway API version:', RUNWAY_VER);
 if (PUBLIC_BASE) console.log('Using PUBLIC_BASE_URL:', PUBLIC_BASE);
@@ -30,11 +30,11 @@ if (PUBLIC_BASE) console.log('Using PUBLIC_BASE_URL:', PUBLIC_BASE);
 const UPLOAD_DIR = path.join(__dirname, '..', 'public', 'uploads');
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-// multer кладёт временный файл в tmp
+// multer во временную папку
 const upload = multer({ dest: path.join(__dirname, '..', 'tmp') });
 
 function absoluteBase(req) {
-  if (PUBLIC_BASE) return PUBLIC_BASE; // надёжный публичный адрес
+  if (PUBLIC_BASE) return PUBLIC_BASE; // фиксированный публичный адрес
   const proto = req.headers['x-forwarded-proto'] || 'https';
   return `${proto}://${req.headers.host}`;
 }
@@ -43,7 +43,7 @@ function absoluteBase(req) {
 app.get('/healthz', (req, res) => res.json({ ok: true }));
 app.get('/', (req, res) => res.type('text/plain').send('OK'));
 
-// ----- Upload endpoint (MVP: локальное хранилище Render) -----
+// ----- Upload endpoint -----
 app.post('/api/upload', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) throw new Error('no file');
@@ -54,7 +54,7 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
 
     const base = absoluteBase(req);
     const fileUrl = `${base}/uploads/${encodeURIComponent(safeName)}`;
-    console.log('Uploaded image URL:', fileUrl); // можно кликнуть в логах и проверить
+    console.log('Uploaded image URL:', fileUrl);
     res.json({ fileUrl });
   } catch (e) {
     console.error('UPLOAD ERROR:', e);
@@ -62,7 +62,7 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
   }
 });
 
-// Раздача загруженных файлов (+fallback-роут на всякий случай)
+// Раздача загруженных файлов (+fallback)
 app.use('/uploads', express.static(UPLOAD_DIR, { fallthrough: true, etag: true, maxAge: '1h' }));
 app.get('/uploads/:name', (req, res) => {
   const filePath = path.join(UPLOAD_DIR, req.params.name);
@@ -76,7 +76,7 @@ function runwayHeaders() {
   h.set('Authorization', `Bearer ${RUNWAY_KEY}`);
   h.set('Content-Type', 'application/json');
   h.set('Accept', 'application/json');
-  h.set('X-Runway-Version', RUNWAY_VER); // критичный заголовок
+  h.set('X-Runway-Version', RUNWAY_VER); // ОБЯЗАТЕЛЬНО
   return h;
 }
 
@@ -117,31 +117,42 @@ app.post('/api/jobs', async (req, res) => {
   }
 });
 
-// Статус задачи + извлечение outputUrl в разных форматах
+// Статус задачи + корректный разбор outputUrl
 async function runwayStatus(id) {
   const r = await fetch(`${RUNWAY_BASE}/v1/tasks/${id}`, { headers: runwayHeaders() });
   const txt = await r.text();
   if (!r.ok) throw new Error(txt);
   const d = JSON.parse(txt);
 
-  const candidates = [
-    d.output?.url,
-    d.output_url,
-    Array.isArray(d.output) && d.output[0]?.url,
-    d.output?.assets?.[0]?.url,
-    d.result?.url,
-    d.result?.assetUrl,
-  ].filter(Boolean);
+  // Собираем все возможные URL'ы (учитываем строки и объекты)
+  const urls = [];
+  if (typeof d.output === 'string') urls.push(d.output);
+  if (Array.isArray(d.output)) {
+    for (const v of d.output) {
+      if (typeof v === 'string') urls.push(v);
+      else if (v && typeof v.url === 'string') urls.push(v.url);
+    }
+  }
+  if (typeof d.output_url === 'string') urls.push(d.output_url);
+  if (d.output?.assets && Array.isArray(d.output.assets)) {
+    for (const a of d.output.assets) {
+      if (a && typeof a.url === 'string') urls.push(a.url);
+    }
+  }
+  if (d.result && typeof d.result.url === 'string') urls.push(d.result.url);
+  if (d.result && typeof d.result.assetUrl === 'string') urls.push(d.result.assetUrl);
 
-  const outputUrl = candidates[0] || null;
-  if ((d.status || d.state) === 'SUCCEEDED' || (d.status || '').toLowerCase() === 'succeeded') {
-    console.log('Runway SUCCEEDED. Output candidates:', candidates);
+  const unique = [...new Set(urls.filter(Boolean))];
+
+  const normalizedStatus = (d.status || d.state || '').toLowerCase();
+  if (normalizedStatus === 'succeeded') {
+    console.log('Runway SUCCEEDED. Output URLs:', unique);
   }
 
   return {
-    status: (d.status || d.state || '').toLowerCase(), // нормализованный статус
+    status: normalizedStatus,
     progressText: d.progress || d.message || d.status || null,
-    outputUrl
+    outputUrl: unique[0] || null
   };
 }
 
@@ -151,7 +162,7 @@ app.get('/api/jobs/:id', async (req, res) => {
   catch (e) { console.error('STATUS ERROR:', e); res.status(500).json({ error: 'status failed' }); }
 });
 
-// SSE-стрим: под капотом периодический опрос статуса
+// SSE (под капотом — polling статуса)
 app.get('/api/jobs/:id/stream', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -169,7 +180,7 @@ app.get('/api/jobs/:id/stream', async (req, res) => {
       const st = await runwayStatus(id);
       res.write(`data: ${JSON.stringify(st)}\n\n`);
       if (st.status === 'succeeded' || st.status === 'failed') break;
-    } catch (e) { /* transient errors ignore */ }
+    } catch (e) { /* ignore transient */ }
     await new Promise(r => setTimeout(r, 2500));
   }
   res.end();
