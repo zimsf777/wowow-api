@@ -1,3 +1,4 @@
+// server/server.js
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
@@ -7,40 +8,44 @@ import fetch, { Headers } from 'node-fetch';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 
+// ----- ES Modules __dirname -----
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// ----- App & middleware -----
 const app = express();
 app.use(express.json({ limit: '10mb' }));
-app.use(cors({ origin: true }));
+app.use(cors({ origin: true })); // MVP: разрешаем все источники, при желании сузим
 
-// ---- CONFIG ----
+// ----- Config -----
 const RUNWAY_BASE = process.env.RUNWAY_API_URL || 'https://api.dev.runwayml.com';
 const RUNWAY_KEY  = process.env.RUNWAY_API_KEY || '';
-const RUNWAY_VER  = process.env.RUNWAY_API_VERSION || '2024-11-06'; // актуальная дата-версия
-const PUBLIC_BASE = process.env.PUBLIC_BASE_URL || null;            // <-- добавили
+const RUNWAY_VER  = process.env.RUNWAY_API_VERSION || '2024-11-06'; // актуальная дата-версия API
+const PUBLIC_BASE = process.env.PUBLIC_BASE_URL || null;             // например: https://api.wowow.ru
+
 console.log('Using Runway API version:', RUNWAY_VER);
 if (PUBLIC_BASE) console.log('Using PUBLIC_BASE_URL:', PUBLIC_BASE);
 
-// ---- UPLOADS ----
+// ----- Uploads -----
 const UPLOAD_DIR = path.join(__dirname, '..', 'public', 'uploads');
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
+// multer кладёт временный файл в tmp
 const upload = multer({ dest: path.join(__dirname, '..', 'tmp') });
 
-function absoluteBase(req){
-  if (PUBLIC_BASE) return PUBLIC_BASE;                 // <-- фикс: всегда тот же публичный домен
+function absoluteBase(req) {
+  if (PUBLIC_BASE) return PUBLIC_BASE; // надёжный публичный адрес
   const proto = req.headers['x-forwarded-proto'] || 'https';
   return `${proto}://${req.headers.host}`;
 }
 
-// health + root
-app.get('/healthz', (req,res)=> res.json({ ok: true }));
-app.get('/', (req,res)=> res.type('text/plain').send('OK'));
+// ----- Health & root -----
+app.get('/healthz', (req, res) => res.json({ ok: true }));
+app.get('/', (req, res) => res.type('text/plain').send('OK'));
 
-// upload proxy
+// ----- Upload endpoint (MVP: локальное хранилище Render) -----
 app.post('/api/upload', upload.single('file'), async (req, res) => {
-  try{
+  try {
     if (!req.file) throw new Error('no file');
     const ext = (req.file.originalname?.split('.').pop() || 'jpg').toLowerCase();
     const safeName = `${Date.now()}-${crypto.randomBytes(3).toString('hex')}.${ext}`;
@@ -49,38 +54,38 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
 
     const base = absoluteBase(req);
     const fileUrl = `${base}/uploads/${encodeURIComponent(safeName)}`;
-    console.log('Uploaded image URL:', fileUrl);       // <-- логируем, чтобы открыть в браузере
+    console.log('Uploaded image URL:', fileUrl); // можно кликнуть в логах и проверить
     res.json({ fileUrl });
-  }catch(e){
+  } catch (e) {
     console.error('UPLOAD ERROR:', e);
     res.status(500).json({ error: 'upload failed' });
   }
 });
 
-// статика и fallback-роут для уверенности
+// Раздача загруженных файлов (+fallback-роут на всякий случай)
 app.use('/uploads', express.static(UPLOAD_DIR, { fallthrough: true, etag: true, maxAge: '1h' }));
-app.get('/uploads/:name', (req,res)=>{
+app.get('/uploads/:name', (req, res) => {
   const filePath = path.join(UPLOAD_DIR, req.params.name);
   if (fs.existsSync(filePath)) return res.sendFile(filePath);
   res.status(404).send('Not found');
 });
 
-// ---- Runway helpers ----
+// ----- Runway helpers -----
 function runwayHeaders() {
   const h = new Headers();
   h.set('Authorization', `Bearer ${RUNWAY_KEY}`);
   h.set('Content-Type', 'application/json');
   h.set('Accept', 'application/json');
-  h.set('X-Runway-Version', RUNWAY_VER);
+  h.set('X-Runway-Version', RUNWAY_VER); // критичный заголовок
   return h;
 }
 
-// Create job (Image to video)
+// Создание задачи (Image to video)
 app.post('/api/jobs', async (req, res) => {
-  try{
+  try {
     const { inputUrl } = req.body || {};
-    if(!inputUrl) return res.status(400).json({ error: 'inputUrl required' });
-    if(!RUNWAY_KEY) return res.status(500).json({ error: 'RUNWAY_API_KEY not set' });
+    if (!inputUrl) return res.status(400).json({ error: 'inputUrl required' });
+    if (!RUNWAY_KEY) return res.status(500).json({ error: 'RUNWAY_API_KEY not set' });
 
     const r = await fetch(`${RUNWAY_BASE}/v1/image_to_video`, {
       method: 'POST',
@@ -94,41 +99,59 @@ app.post('/api/jobs', async (req, res) => {
     });
 
     const txt = await r.text();
-    if(!r.ok){
+    if (!r.ok) {
       console.error('Runway create failed:', txt);
       return res.status(502).json({ error: 'Runway create failed', detail: txt });
     }
+
     const created = JSON.parse(txt);
     const jobId = created.id || created.task_id || created.taskId;
-    if(!jobId){
+    if (!jobId) {
       console.error('Runway: no job id in response:', created);
       return res.status(502).json({ error: 'Runway: no job id', detail: created });
     }
     res.json({ jobId });
-  }catch(e){
+  } catch (e) {
     console.error('CREATE JOB ERROR:', e);
     res.status(500).json({ error: 'create job failed' });
   }
 });
 
-// Status + SSE
-async function runwayStatus(id){
+// Статус задачи + извлечение outputUrl в разных форматах
+async function runwayStatus(id) {
   const r = await fetch(`${RUNWAY_BASE}/v1/tasks/${id}`, { headers: runwayHeaders() });
   const txt = await r.text();
-  if(!r.ok) throw new Error(txt);
+  if (!r.ok) throw new Error(txt);
   const d = JSON.parse(txt);
+
+  const candidates = [
+    d.output?.url,
+    d.output_url,
+    Array.isArray(d.output) && d.output[0]?.url,
+    d.output?.assets?.[0]?.url,
+    d.result?.url,
+    d.result?.assetUrl,
+  ].filter(Boolean);
+
+  const outputUrl = candidates[0] || null;
+  if ((d.status || d.state) === 'SUCCEEDED' || (d.status || '').toLowerCase() === 'succeeded') {
+    console.log('Runway SUCCEEDED. Output candidates:', candidates);
+  }
+
   return {
-    status: d.status,
-    progressText: d.progress || d.message || null,
-    outputUrl: d.output?.url || d.output_url || null
+    status: (d.status || d.state || '').toLowerCase(), // нормализованный статус
+    progressText: d.progress || d.message || d.status || null,
+    outputUrl
   };
 }
 
-app.get('/api/jobs/:id', async (req,res)=>{
+// REST-статус
+app.get('/api/jobs/:id', async (req, res) => {
   try { res.json(await runwayStatus(req.params.id)); }
-  catch(e){ console.error('STATUS ERROR:', e); res.status(500).json({ error: 'status failed' }); }
+  catch (e) { console.error('STATUS ERROR:', e); res.status(500).json({ error: 'status failed' }); }
 });
 
+// SSE-стрим: под капотом периодический опрос статуса
 app.get('/api/jobs/:id/stream', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -137,20 +160,21 @@ app.get('/api/jobs/:id/stream', async (req, res) => {
 
   const id = req.params.id;
   let closed = false;
-  req.on('close', ()=> { closed = true; });
+  req.on('close', () => { closed = true; });
 
   res.write(`data: ${JSON.stringify({ status: 'running', progressText: 'Ожидание статуса…' })}\n\n`);
 
-  while(!closed){
-    try{
+  while (!closed) {
+    try {
       const st = await runwayStatus(id);
       res.write(`data: ${JSON.stringify(st)}\n\n`);
-      if(st.status === 'succeeded' || st.status === 'failed') break;
-    }catch(e){}
-    await new Promise(r=>setTimeout(r, 2500));
+      if (st.status === 'succeeded' || st.status === 'failed') break;
+    } catch (e) { /* transient errors ignore */ }
+    await new Promise(r => setTimeout(r, 2500));
   }
   res.end();
 });
 
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, ()=> console.log('API listening on :' + PORT));
+// ----- Start -----
+const PORT = process.env.PORT || 10000; // Render задаёт PORT
+app.listen(PORT, () => console.log('API listening on :' + PORT));
