@@ -3,7 +3,7 @@ import cors from 'cors';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
-import fetch from 'node-fetch';
+import fetch, { Headers } from 'node-fetch';   // <— берём Headers явно
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 
@@ -15,7 +15,7 @@ const app = express();
 app.use(express.json({ limit: '10mb' }));
 app.use(cors({ origin: true }));
 
-// uploads
+// dirs
 const UPLOAD_DIR = path.join(__dirname, '..', 'public', 'uploads');
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 const upload = multer({ dest: path.join(__dirname, '..', 'tmp') });
@@ -29,7 +29,7 @@ function absoluteBase(req){
 app.get('/healthz', (req,res)=> res.json({ ok: true }));
 app.get('/', (req,res)=> res.type('text/plain').send('OK'));
 
-// proxy upload (MVP)
+// upload proxy (MVP)
 app.post('/api/upload', upload.single('file'), async (req, res) => {
   try{
     if (!req.file) throw new Error('no file');
@@ -44,20 +44,20 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
   }
 });
 
-app.use('/uploads', express.static(UPLOAD_DIR));
-
 // Runway config
 const RUNWAY_BASE = process.env.RUNWAY_API_URL || 'https://api.dev.runwayml.com';
 const RUNWAY_KEY  = process.env.RUNWAY_API_KEY || '';
-// Возьмём версию из ENV (если зададите), иначе — стабильную из доков.
-const RUNWAY_VER  = process.env.RUNWAY_API_VERSION || '2024-09-30';
+const RUNWAY_VER  = process.env.RUNWAY_API_VERSION || '2024-10-01'; // 👈 задаём версию
+console.log('Using Runway API version:', RUNWAY_VER);
 
-const commonHeaders = {
-  'Authorization': `Bearer ${RUNWAY_KEY}`,
-  'Content-Type': 'application/json',
-  'Accept': 'application/json',
-  'X-Runway-Version': RUNWAY_VER
-};
+function runwayHeaders() {
+  const h = new Headers();
+  h.set('Authorization', `Bearer ${RUNWAY_KEY}`);
+  h.set('Content-Type', 'application/json');
+  h.set('Accept', 'application/json');
+  h.set('X-Runway-Version', RUNWAY_VER);       // 👈 критичный заголовок
+  return h;
+}
 
 // Create job (Image to video)
 app.post('/api/jobs', async (req, res) => {
@@ -68,7 +68,7 @@ app.post('/api/jobs', async (req, res) => {
 
     const r = await fetch(`${RUNWAY_BASE}/v1/image_to_video`, {
       method: 'POST',
-      headers: commonHeaders,
+      headers: runwayHeaders(),
       body: JSON.stringify({
         model: 'gen4_turbo',
         duration: 5,
@@ -76,6 +76,7 @@ app.post('/api/jobs', async (req, res) => {
         promptImage: inputUrl
       })
     });
+
     const txt = await r.text();
     if(!r.ok){
       console.error('Runway create failed:', txt);
@@ -84,7 +85,7 @@ app.post('/api/jobs', async (req, res) => {
     const created = JSON.parse(txt);
     const jobId = created.id || created.task_id || created.taskId;
     if(!jobId){
-      console.error('Runway missing job id:', created);
+      console.error('Runway: no job id in response:', created);
       return res.status(502).json({ error: 'Runway: no job id', detail: created });
     }
     res.json({ jobId });
@@ -94,9 +95,11 @@ app.post('/api/jobs', async (req, res) => {
   }
 });
 
-// Status helpers (тоже с версией!)
+// Status helpers (тоже с версионным заголовком)
 async function runwayStatus(id){
-  const r = await fetch(`${RUNWAY_BASE}/v1/tasks/${id}`, { headers: commonHeaders });
+  const r = await fetch(`${RUNWAY_BASE}/v1/tasks/${id}`, {
+    headers: runwayHeaders()
+  });
   const txt = await r.text();
   if(!r.ok) throw new Error(txt);
   const d = JSON.parse(txt);
@@ -108,7 +111,7 @@ async function runwayStatus(id){
 }
 
 app.get('/api/jobs/:id', async (req,res)=>{
-  try{ res.json(await runwayStatus(req.params.id)); }
+  try { res.json(await runwayStatus(req.params.id)); }
   catch(e){ console.error('STATUS ERROR:', e); res.status(500).json({ error: 'status failed' }); }
 });
 
