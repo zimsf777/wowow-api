@@ -3,11 +3,10 @@ import cors from 'cors';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
-import fetch, { Headers } from 'node-fetch';   // <— берём Headers явно
+import fetch, { Headers } from 'node-fetch';
 import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 
-// __dirname for ES modules
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -15,12 +14,22 @@ const app = express();
 app.use(express.json({ limit: '10mb' }));
 app.use(cors({ origin: true }));
 
-// dirs
+// ---- CONFIG ----
+const RUNWAY_BASE = process.env.RUNWAY_API_URL || 'https://api.dev.runwayml.com';
+const RUNWAY_KEY  = process.env.RUNWAY_API_KEY || '';
+const RUNWAY_VER  = process.env.RUNWAY_API_VERSION || '2024-11-06'; // актуальная дата-версия
+const PUBLIC_BASE = process.env.PUBLIC_BASE_URL || null;            // <-- добавили
+console.log('Using Runway API version:', RUNWAY_VER);
+if (PUBLIC_BASE) console.log('Using PUBLIC_BASE_URL:', PUBLIC_BASE);
+
+// ---- UPLOADS ----
 const UPLOAD_DIR = path.join(__dirname, '..', 'public', 'uploads');
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
 const upload = multer({ dest: path.join(__dirname, '..', 'tmp') });
 
 function absoluteBase(req){
+  if (PUBLIC_BASE) return PUBLIC_BASE;                 // <-- фикс: всегда тот же публичный домен
   const proto = req.headers['x-forwarded-proto'] || 'https';
   return `${proto}://${req.headers.host}`;
 }
@@ -29,14 +38,18 @@ function absoluteBase(req){
 app.get('/healthz', (req,res)=> res.json({ ok: true }));
 app.get('/', (req,res)=> res.type('text/plain').send('OK'));
 
-// upload proxy (MVP)
+// upload proxy
 app.post('/api/upload', upload.single('file'), async (req, res) => {
   try{
     if (!req.file) throw new Error('no file');
     const ext = (req.file.originalname?.split('.').pop() || 'jpg').toLowerCase();
     const safeName = `${Date.now()}-${crypto.randomBytes(3).toString('hex')}.${ext}`;
-    fs.renameSync(req.file.path, path.join(UPLOAD_DIR, safeName));
-    const fileUrl = absoluteBase(req) + '/uploads/' + safeName;
+    const target = path.join(UPLOAD_DIR, safeName);
+    fs.renameSync(req.file.path, target);
+
+    const base = absoluteBase(req);
+    const fileUrl = `${base}/uploads/${encodeURIComponent(safeName)}`;
+    console.log('Uploaded image URL:', fileUrl);       // <-- логируем, чтобы открыть в браузере
     res.json({ fileUrl });
   }catch(e){
     console.error('UPLOAD ERROR:', e);
@@ -44,25 +57,21 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
   }
 });
 
-// Runway config
-const RUNWAY_BASE = process.env.RUNWAY_API_URL || 'https://api.dev.runwayml.com';
-const RUNWAY_KEY  = process.env.RUNWAY_API_KEY || '';
-const RUNWAY_VER  = process.env.RUNWAY_API_VERSION || '2024-11-06';
+// статика и fallback-роут для уверенности
+app.use('/uploads', express.static(UPLOAD_DIR, { fallthrough: true, etag: true, maxAge: '1h' }));
+app.get('/uploads/:name', (req,res)=>{
+  const filePath = path.join(UPLOAD_DIR, req.params.name);
+  if (fs.existsSync(filePath)) return res.sendFile(filePath);
+  res.status(404).send('Not found');
+});
+
+// ---- Runway helpers ----
 function runwayHeaders() {
   const h = new Headers();
   h.set('Authorization', `Bearer ${RUNWAY_KEY}`);
   h.set('Content-Type', 'application/json');
   h.set('Accept', 'application/json');
   h.set('X-Runway-Version', RUNWAY_VER);
-  return h;
-}
-
-function runwayHeaders() {
-  const h = new Headers();
-  h.set('Authorization', `Bearer ${RUNWAY_KEY}`);
-  h.set('Content-Type', 'application/json');
-  h.set('Accept', 'application/json');
-  h.set('X-Runway-Version', RUNWAY_VER);       // 👈 критичный заголовок
   return h;
 }
 
@@ -102,11 +111,9 @@ app.post('/api/jobs', async (req, res) => {
   }
 });
 
-// Status helpers (тоже с версионным заголовком)
+// Status + SSE
 async function runwayStatus(id){
-  const r = await fetch(`${RUNWAY_BASE}/v1/tasks/${id}`, {
-    headers: runwayHeaders()
-  });
+  const r = await fetch(`${RUNWAY_BASE}/v1/tasks/${id}`, { headers: runwayHeaders() });
   const txt = await r.text();
   if(!r.ok) throw new Error(txt);
   const d = JSON.parse(txt);
@@ -122,7 +129,6 @@ app.get('/api/jobs/:id', async (req,res)=>{
   catch(e){ console.error('STATUS ERROR:', e); res.status(500).json({ error: 'status failed' }); }
 });
 
-// SSE (внутри — polling статуса)
 app.get('/api/jobs/:id/stream', async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
