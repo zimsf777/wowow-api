@@ -47,8 +47,15 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
 // Runway config
 const RUNWAY_BASE = process.env.RUNWAY_API_URL || 'https://api.dev.runwayml.com';
 const RUNWAY_KEY  = process.env.RUNWAY_API_KEY || '';
-const RUNWAY_VER  = process.env.RUNWAY_API_VERSION || '2024-10-01'; // 👈 задаём версию
-console.log('Using Runway API version:', RUNWAY_VER);
+const RUNWAY_VER  = process.env.RUNWAY_API_VERSION || '2024-11-06';
+function runwayHeaders() {
+  const h = new Headers();
+  h.set('Authorization', `Bearer ${RUNWAY_KEY}`);
+  h.set('Content-Type', 'application/json');
+  h.set('Accept', 'application/json');
+  h.set('X-Runway-Version', RUNWAY_VER);
+  return h;
+}
 
 function runwayHeaders() {
   const h = new Headers();
